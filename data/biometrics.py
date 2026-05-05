@@ -20,4 +20,3 @@ class Biometric(SqlAlchemyBase):
     def __repr__(self):
         return f'<Biometric> {self.parameter_type}: {self.value}'
 
-# заготовка под данные пользователя
