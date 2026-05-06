@@ -1,25 +1,27 @@
+import asyncio
+import os
+from datetime import date, datetime, timedelta
+
 from aiogram import Dispatcher, Bot, types, filters, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
-import os
-import asyncio
-from sqlalchemy import select, func
+from sqlalchemy import select, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from data import db_session
-from data.users import User
-from data.biometrics import Biometric
+from data.active_timers import ActiveTimer
 from data.activites import Activity
 from data.activity_types import ActivityType
-from data.active_timers import ActiveTimer
-
-from datetime import date, datetime, timedelta
+from data.biometrics import Biometric
+from data.users import User
+from weather_api import get_current_weather, get_city_coordinates
 
 load_dotenv()
 
@@ -80,6 +82,46 @@ if not TOKEN:
         "4. Перезапустите бота"
     )
 
+from aiogram import BaseMiddleware
+
+
+class DeletedUserMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user_id = None
+        text = None
+
+        if isinstance(event, types.Message):
+            user_id = event.from_user.id
+            text = event.text
+        elif isinstance(event, types.CallbackQuery):
+            user_id = event.from_user.id
+            text = event.data
+
+        if user_id:
+            if text and text.startswith('/start'):
+                return await handler(event, data)
+
+            async for session in db_session.create_async_session():
+                result = await session.execute(select(User).where(User.id == user_id))
+                user = result.scalars().first()
+
+                if user and user.is_deleted:  # а ведь можно забанить кого-то конкретного... а впрочем
+                    msg = "❌ <b>Ваш аккаунт удален.</b>\nОтправьте /start для восстановления."
+
+                    if isinstance(event, types.Message):
+                        await event.answer(msg, reply_markup=types.ReplyKeyboardRemove())
+                    elif isinstance(event, types.CallbackQuery):
+                        await event.answer("❌ Аккаунт удален!", show_alert=True)
+                        try:
+                            await event.message.answer(msg, reply_markup=types.ReplyKeyboardRemove())
+                        except TelegramBadRequest:
+                            pass
+
+                    return
+
+        return await handler(event, data)
+
+
 if PROXY_URL:
     print(f"🔒 Использую прокси: {PROXY_URL}")
     session = AiohttpSession(proxy=PROXY_URL)
@@ -100,6 +142,7 @@ class BioStates(StatesGroup):
     waiting_for_age = State()
     waiting_for_height = State()
     waiting_for_weight = State()
+    waiting_for_city = State()
 
 
 class ActivityStates(StatesGroup):
@@ -123,7 +166,9 @@ def main_kb():
             [KeyboardButton(text="👤 Профиль")],
             [KeyboardButton(text="🗑 Удаление данных")]
         ],
-        resize_keyboard=True
+        resize_keyboard=True,
+        is_persistent=True,
+
     )
 
 
@@ -135,7 +180,9 @@ def bio_kb():
             [InlineKeyboardButton(text="Рост",
                                   callback_data="bio_height")],
             [InlineKeyboardButton(text="Вес",
-                                  callback_data="bio_weight")]
+                                  callback_data="bio_weight")],
+            [InlineKeyboardButton(text="Город",
+                                  callback_data="bio_city")]
         ]
     )
 
@@ -225,7 +272,7 @@ async def update_user_experience(user_id: int, minutes: int):
     return False, 1
 
 
-async def update_bio_db(user_id: int, field: str, value: int):
+async def update_bio_db(user_id: int, field: str, value):
     async for session in db_session.create_async_session():
         result = await session.execute(
             select(Biometric).where(Biometric.user_id == user_id)
@@ -233,7 +280,7 @@ async def update_bio_db(user_id: int, field: str, value: int):
         bio = result.scalars().first()
 
         if not bio:
-            bio = Biometric(user_id=user_id, age=0, height=0, weight=0)
+            bio = Biometric(user_id=user_id, age=0, height=0, weight=0, city="Не указан")
             session.add(bio)
 
         if field == "age":
@@ -242,6 +289,8 @@ async def update_bio_db(user_id: int, field: str, value: int):
             bio.height = value
         elif field == "weight":
             bio.weight = value
+        elif field == "city":
+            bio.city = value
 
         await session.commit()
 
@@ -265,6 +314,20 @@ async def cmd_start(message: types.Message):
             await message.answer(
                 f"🎉 {message.from_user.first_name}, добро пожаловать в PyTracker!\n"
                 f"Заполните данные о себе для продолжения.",
+                reply_markup=main_kb()
+            )
+        elif existing_user.is_deleted:
+            existing_user.is_deleted = False
+            existing_user.username = message.from_user.username
+            existing_user.registration_date = datetime.now()
+            existing_user.level = 1
+            existing_user.experience = 0
+            existing_user.total_minutes = 0
+            await session.commit()
+
+            await message.answer(
+                f"🎉 {message.from_user.first_name}, добро пожаловать обратно в PyTracker!\n"
+                f"Ваш профиль был создан заново. Заполните данные о себе для продолжения.",
                 reply_markup=main_kb()
             )
         else:
@@ -295,8 +358,29 @@ async def bio_callback(callback: types.CallbackQuery, state: FSMContext):
     elif action == "weight":
         await state.set_state(BioStates.waiting_for_weight)
         await callback.message.answer("Введите ваш вес (в килограммах):")
+    elif action == "city":
+        await state.set_state(BioStates.waiting_for_city)
+        await callback.message.answer("Введите ваш город (например: Москва):")
 
     await callback.answer()
+
+
+@dp.message(BioStates.waiting_for_city)
+async def set_city(message: types.Message, state: FSMContext):
+    city_name = message.text.strip()
+
+    wait_msg = await message.answer("⏳ Ищу город в базе...")
+
+    lat, lon, resolved_name = await get_city_coordinates(city_name)
+
+    if lat is not None and lon is not None:
+        await update_bio_db(message.from_user.id, "city", resolved_name)
+        await wait_msg.edit_text(
+            f"✅ Город успешно найден и сохранен: <b>{resolved_name}</b>!\nТеперь мы сможем показывать погоду.")
+        await state.clear()
+    else:
+        await wait_msg.edit_text(
+            "❌ Город не найден. Попробуйте написать название иначе (например, на английском языке или ближайший крупный город).")
 
 
 @dp.message(BioStates.waiting_for_age)
@@ -363,9 +447,8 @@ async def process_activities(message: types.Message):
 
 async def get_or_create_activity_type(session: AsyncSession, name: str):
     name = name.strip().lower()
-
     result = await session.execute(
-        select(ActivityType).where(ActivityType.name.ilike(f"%{name}%"))
+        select(ActivityType).where(ActivityType.name.contains(name))
     )
     activity = result.scalars().first()
 
@@ -438,6 +521,7 @@ async def view_activities(callback: types.CallbackQuery):
 
         result = await session.execute(
             select(Activity)
+            .options(selectinload(Activity.activity_type_rel))
             .where(Activity.user_id == callback.from_user.id)
             .order_by(Activity.date.desc())
         )
@@ -613,17 +697,22 @@ async def timer_start(callback: types.CallbackQuery, state: FSMContext):
 
         if active_timer:
             elapsed = datetime.now() - active_timer.start_time
-            total_seconds = int(elapsed.total_seconds())
-            hours = total_seconds // 3600
-            minutes = (total_seconds % 3600) // 60
-            seconds = total_seconds % 60
+            time_str = str(elapsed).split('.')[0]
 
-            await callback.answer(
-                f"❌ У вас уже запущен таймер!\n"
-                f"Тип: {active_timer.activity_type}\n"
-                f"Прошло: {hours:02d}:{minutes:02d}:{seconds:02d}",
-                show_alert=True
+            inline_kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⏹ Завершить текущий", callback_data="timer_stop")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="delete_msg")]
+            ])
+
+            await callback.message.answer(
+                f"⚠️ <b>У вас уже есть запущенный таймер!</b>\n\n"
+                f"🏃 Активность: <b>{active_timer.activity_type}</b>\n"
+                f"⏱ Прошло времени: <b>{time_str}</b>\n\n"
+                f"Вы не можете запустить новый, пока не остановите текущий.",
+                reply_markup=inline_kb,
+                parse_mode="HTML"
             )
+            await callback.answer()
             return
 
         await state.set_state(TimerStates.waiting_for_activity_type)
@@ -634,30 +723,56 @@ async def timer_start(callback: types.CallbackQuery, state: FSMContext):
 @dp.message(TimerStates.waiting_for_activity_type)
 async def timer_set_type(message: types.Message, state: FSMContext):
     activity_type = message.text.strip().lower()
+    user_id = message.from_user.id
 
     async for session in db_session.create_async_session():
         result = await session.execute(
-            select(ActivityType).where(ActivityType.name.ilike(f"%{activity_type}%"))
+            select(ActiveTimer).where(ActiveTimer.user_id == user_id)
         )
-        activity = result.scalars().first()
+        timer = result.scalars().first()
+
+        if timer and timer.is_active:
+            inline_kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⏹ Завершить текущий", callback_data="timer_stop")]
+            ])
+            await message.answer("❌ Не удалось запустить: у вас уже активен другой таймер.",
+                                 reply_markup=inline_kb)
+            await state.clear()
+            return
+
+        act_type_res = await session.execute(
+            select(ActivityType).where(ActivityType.name.contains(activity_type))
+        )
+        activity = act_type_res.scalars().first()
 
         if not activity:
-            await message.answer(
-                "❌ Такой тип активности не найден.\n"
-                "Попробуйте другой или обратитесь к администратору."
-            )
+            await message.answer("❌ Такой тип активности не найден. Попробуйте другое название.")
             return
 
         start_time = datetime.now()
 
-        timer = ActiveTimer(
-            user_id=message.from_user.id,
-            activity_type=activity.name,
-            start_time=start_time,
-            is_active=True
-        )
-        session.add(timer)
-        await session.commit()
+        try:
+            if timer:
+                timer.activity_type = activity.name
+                timer.start_time = start_time
+                timer.is_active = True
+            else:
+                new_timer = ActiveTimer(
+                    user_id=user_id,
+                    activity_type=activity.name,
+                    start_time=start_time,
+                    is_active=True
+                )
+                session.add(new_timer)
+
+            await session.commit()
+
+        except Exception as e:
+            await session.rollback()
+            print(f"Ошибка при сохранении таймера: {e}")
+            await message.answer("❌ Ошибка базы данных при запуске.")
+            await state.clear()
+            return
 
         timer_msg = await message.answer(
             f"⏱ <b>ТАЙМЕР ЗАПУЩЕН</b>\n\n"
@@ -671,21 +786,20 @@ async def timer_set_type(message: types.Message, state: FSMContext):
 
         task = asyncio.create_task(
             update_timer_message(
-                user_id=message.from_user.id,
+                user_id=user_id,
                 chat_id=message.chat.id,
                 message_id=timer_msg.message_id,
                 activity_type=activity.name,
                 start_time=start_time
             )
         )
-
-        active_timer_tasks[message.from_user.id] = task
-
+        active_timer_tasks[user_id] = task
         await state.clear()
 
 
 @dp.callback_query(F.data == "timer_stop")
 async def timer_stop(callback: types.CallbackQuery):
+    weather_text = ""
     user_id = callback.from_user.id
 
     if user_id in active_timer_tasks:
@@ -726,6 +840,20 @@ async def timer_stop(callback: types.CallbackQuery):
             session.add(new_activity)
 
             timer.is_active = False
+
+            bio_result = await session.execute(
+                select(Biometric).where(Biometric.user_id == user_id)
+            )
+            bio = bio_result.scalars().first()
+
+            if bio and getattr(bio, 'city', None) and bio.city != "Не указан":
+                lat, lon, _ = await get_city_coordinates(bio.city)
+                if lat and lon:
+                    weather_data = await get_current_weather(lat, lon)
+                    if weather_data:
+                        temp = weather_data.get('temperature')
+                        weather_text = f"\n🌡️ Температура на тренировке: <b>{temp}°C</b>"
+
             await session.commit()
 
             leveled_up, new_level = await update_user_experience(user_id, minutes)
@@ -738,6 +866,7 @@ async def timer_stop(callback: types.CallbackQuery):
                 f"⏱ Длительность: <b>{time_str}</b>\n"
                 f"📊 Зачтено минут: <b>{minutes} мин.</b>\n"
                 f"📅 {timer.start_time.strftime('%H:%M:%S')} - {datetime.now().strftime('%H:%M:%S')}"
+                f"{weather_text}"
             )
 
             if leveled_up:
@@ -818,6 +947,9 @@ async def show_profile(message: types.Message):
             profile_text += f"🎂 Возраст: {bio.age} лет\n"
             profile_text += f"📏 Рост: {bio.height} см\n"
             profile_text += f"⚖️ Вес: {bio.weight} кг\n"
+
+            city = getattr(bio, 'city', 'Не указан')
+            profile_text += f"🌍 Город: {city}\n"
 
             if bio.height > 0 and bio.weight > 0:
                 height_m = bio.height / 100
@@ -1069,10 +1201,74 @@ async def stats_back(callback: types.CallbackQuery):
 
 ### КОНЕЦ СТАТИСТИКИ
 
+### УДАЛЕНИЕ ДАННЫХ
+
 @dp.message(F.text == "🗑 Удаление данных")
 async def delete_user_info(message: types.Message):
-    await message.answer("🚧 WIP - Функция в разработке")
+    inline_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить всё", callback_data="confirm_delete_all")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_delete")]
+    ])
 
+    await message.answer(
+        "<b>⚠️ ВНИМАНИЕ! Необратимое действие!</b>\n\n"
+        "Это удалит всю вашу историю активностей, биометрические данные и прогресс (уровни/минуты).\n"
+        "Вы уверены, что хотите удалить свой профиль?",
+        reply_markup=inline_kb
+    )
+
+
+@dp.callback_query(F.data == "confirm_delete_all")
+async def process_delete_confirm(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+
+    async for session in db_session.create_async_session():
+        try:
+            await session.execute(
+                delete(ActiveTimer).where(ActiveTimer.user_id == user_id)
+            )
+
+            await session.execute(
+                delete(Activity).where(Activity.user_id == user_id)
+            )
+
+            await session.execute(
+                delete(Biometric).where(Biometric.user_id == user_id)
+            )
+
+            result = await session.execute(select(User).where(User.id == user_id))
+            user = result.scalars().first()
+            if user:
+                user.is_deleted = True
+                user.level = 1
+                user.experience = 0
+                user.total_minutes = 0
+
+            await session.commit()
+
+            if user_id in active_timer_tasks:
+                active_timer_tasks[user_id].cancel()
+                del active_timer_tasks[user_id]
+
+            await callback.message.edit_text(
+                "✅ Все ваши данные были успешно удалены. До свидания!\n\n"
+                "<i>(Чтобы начать заново, отправьте команду /start)</i>",
+                reply_markup=None
+            )
+
+        except Exception as e:
+            await session.rollback()
+            print(f"Ошибка при удалении данных пользователя {user_id}: {e}")
+            await callback.answer("❌ Произошла ошибка базы данных при удалении.", show_alert=True)
+
+
+@dp.callback_query(F.data == "cancel_delete")
+async def process_delete_cancel(callback: types.CallbackQuery):
+    await callback.message.edit_text("Удаление отменено. Продолжаем тренировки! 💪", reply_markup=None)
+    await callback.answer()
+
+
+### КОНЕЦ УДАЛЕНИЯ ДАННЫХ
 
 @dp.message()
 async def reply_me(message: types.Message):
@@ -1087,11 +1283,11 @@ async def main():
 
     db_path = os.path.join(db_dir, "tracker.db")
     print(f"📁 База данных: {db_path}")
-
-    if os.path.exists(db_path):
-        print("🗑 Удаляю старую базу данных...")
-        os.remove(db_path)
-
+    #
+    # if os.path.exists(db_path):
+    #     print("🗑 Удаляю старую базу данных...")
+    #     os.remove(db_path)
+    #
     db_session.global_init(db_path)
     print("✅ База данных инициализирована")
 
@@ -1113,6 +1309,9 @@ async def main():
                 print(f"  ➕ Добавлен тип активности: {act_name}")
 
         await session.commit()
+
+    dp.message.middleware(DeletedUserMiddleware())
+    dp.callback_query.middleware(DeletedUserMiddleware())
 
     print("🚀 Бот запущен!")
 

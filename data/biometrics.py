@@ -13,10 +13,11 @@ class Biometric(SqlAlchemyBase):
     height = Column(Integer, nullable=False)
     weight = Column(Integer, nullable=False)
 
+    city = Column(String, nullable=False)
+
     date = Column(DateTime, default=datetime.datetime.now)
 
     user = orm.relationship('User', back_populates='biometrics')
 
     def __repr__(self):
         return f'<Biometric> {self.parameter_type}: {self.value}'
-
