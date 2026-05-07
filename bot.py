@@ -187,6 +187,17 @@ def bio_kb():
     )
 
 
+def cancel_bio_kb():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text="❌ Выйти из заполнения",
+                callback_data="cancel_bio"
+            )]
+        ]
+    )
+
+
 def activities_kb():
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -344,6 +355,16 @@ async def bio_menu(message: types.Message):
     await message.answer("Выберите параметр для заполнения:",
                          reply_markup=bio_kb())
 
+@dp.callback_query(F.data == "cancel_bio")
+async def cancel_bio(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+
+    await callback.message.edit_text(
+        "❌ Заполнение отменено."
+    )
+
+    await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("bio_"))
 async def bio_callback(callback: types.CallbackQuery, state: FSMContext):
@@ -380,7 +401,8 @@ async def set_city(message: types.Message, state: FSMContext):
         await state.clear()
     else:
         await wait_msg.edit_text(
-            "❌ Город не найден. Попробуйте написать название иначе (например, на английском языке или ближайший крупный город).")
+            "❌ Город не найден. Попробуйте написать название иначе (например, на английском языке или ближайший крупный город).",
+        reply_markup=cancel_bio_kb())
 
 
 @dp.message(BioStates.waiting_for_age)
@@ -392,9 +414,11 @@ async def set_age(message: types.Message, state: FSMContext):
             await message.answer("✅ Возраст успешно сохранен!")
             await state.clear()
         else:
-            await message.answer(f"❌ Пожалуйста, введите реальный возраст (от {MIN_AGE} до {MAX_AGE}).")
+            await message.answer(f"❌ Пожалуйста, введите реальный возраст (от {MIN_AGE} до {MAX_AGE}).",
+                                 reply_markup=cancel_bio_kb())
     else:
-        await message.answer("❌ Пожалуйста, введите число.")
+        await message.answer("❌ Пожалуйста, введите число.",
+                             reply_markup=cancel_bio_kb())
 
 
 @dp.message(BioStates.waiting_for_height)
@@ -406,9 +430,11 @@ async def set_height(message: types.Message, state: FSMContext):
             await message.answer("✅ Рост успешно сохранен!")
             await state.clear()
         else:
-            await message.answer(f"❌ Пожалуйста, введите реальный рост (от {MIN_HEIGHT} до {MAX_HEIGHT} сантиметров).")
+            await message.answer(f"❌ Пожалуйста, введите реальный рост (от {MIN_HEIGHT} до {MAX_HEIGHT} сантиметров).",
+                                 reply_markup=cancel_bio_kb())
     else:
-        await message.answer("❌ Пожалуйста, введите число.")
+        await message.answer("❌ Пожалуйста, введите число.",
+                             reply_markup=cancel_bio_kb())
 
 
 @dp.message(BioStates.waiting_for_weight)
@@ -420,9 +446,11 @@ async def set_weight(message: types.Message, state: FSMContext):
             await message.answer("✅ Вес успешно сохранен!")
             await state.clear()
         else:
-            await message.answer(f"❌ Пожалуйста, введите реальный вес (от {MIN_WEIGHT} до {MAX_WEIGHT} килограммов).")
+            await message.answer(f"❌ Пожалуйста, введите реальный вес (от {MIN_WEIGHT} до {MAX_WEIGHT} килограммов).",
+                                 reply_markup=cancel_bio_kb())
     else:
-        await message.answer("❌ Пожалуйста, введите число.")
+        await message.answer("❌ Пожалуйста, введите число.",
+                             reply_markup=cancel_bio_kb())
 
 
 ### КОНЕЦ БИОМЕТРИКИ
@@ -615,7 +643,6 @@ async def act_back(callback: types.CallbackQuery):
 ### ТАЙМЕР ТРЕНИРОВКИ
 
 async def update_timer_message(user_id: int, chat_id: int, message_id: int, activity_type: str, start_time: datetime):
-    """Обновляет сообщение таймера каждую секунду"""
     try:
         while True:
             if user_id not in active_timer_tasks:
