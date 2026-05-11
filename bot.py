@@ -1,6 +1,6 @@
 import asyncio
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from aiogram import Dispatcher, Bot, types, filters, F
 from aiogram.client.default import DefaultBotProperties
@@ -31,6 +31,10 @@ MIN_HEIGHT = 50
 MAX_HEIGHT = 272
 MIN_WEIGHT = 20
 MAX_WEIGHT = 500
+
+MSK = timezone(
+    timedelta(hours=3))  # можно через город находить, но это бееее, больше кода надо фууу ээээ бубубубебебебе
+freetime = 2  # я не придумал названия лучше для переменной, что будет держать время обновления таймера.
 
 LEVEL_THRESHOLDS = [
     0,  # Level 1: 0 минут
@@ -355,7 +359,9 @@ async def bio_menu(message: types.Message):
     await message.answer("Выберите параметр для заполнения:",
                          reply_markup=bio_kb())
 
-@dp.callback_query(F.data == "cancel_bio")
+
+@dp.callback_query(
+    F.data == "cancel_bio")  # изначально это должно было быть чисто для биометрики, но как-то хорошо это легло на весь проект...
 async def cancel_bio(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
 
@@ -402,7 +408,7 @@ async def set_city(message: types.Message, state: FSMContext):
     else:
         await wait_msg.edit_text(
             "❌ Город не найден. Попробуйте написать название иначе (например, на английском языке или ближайший крупный город).",
-        reply_markup=cancel_bio_kb())
+            reply_markup=cancel_bio_kb())
 
 
 @dp.message(BioStates.waiting_for_age)
@@ -642,59 +648,6 @@ async def act_back(callback: types.CallbackQuery):
 
 ### ТАЙМЕР ТРЕНИРОВКИ
 
-async def update_timer_message(user_id: int, chat_id: int, message_id: int, activity_type: str, start_time: datetime):
-    try:
-        while True:
-            if user_id not in active_timer_tasks:
-                break
-
-            now = datetime.now()
-            elapsed = now - start_time
-
-            total_seconds = int(elapsed.total_seconds())
-            hours = total_seconds // 3600
-            minutes = (total_seconds % 3600) // 60
-            seconds = total_seconds % 60
-
-            seconds_progress = seconds / 60 * 10
-            bar_filled = int(seconds_progress)
-            bar = "█" * bar_filled + "░" * (10 - bar_filled)
-
-            timer_text = (
-                f"⏱ <b>ТАЙМЕР АКТИВЕН</b>\n\n"
-                f"🏃 Активность: <b>{activity_type}</b>\n"
-                f"⏱ Время: <b>{hours:02d}:{minutes:02d}:{seconds:02d}</b>\n"
-                f"[{bar}] {seconds}с\n\n"
-                f"📅 Начало: {start_time.strftime('%H:%M:%S')}\n"
-                f"🔄 Автообновление..."
-            )
-
-            try:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=timer_text,
-                    reply_markup=timer_kb(is_active=True)
-                )
-            except TelegramBadRequest as e:
-                if "message is not modified" not in str(e):
-                    print(f"Ошибка обновления таймера: {e}")
-                    break
-            except Exception as e:
-                print(f"Ошибка таймера: {e}")
-                break
-
-            await asyncio.sleep(1)
-
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        print(f"Таймер остановлен с ошибкой: {e}")
-    finally:
-        if user_id in active_timer_tasks:
-            del active_timer_tasks[user_id]
-
-
 @dp.message(F.text == "⏱ Таймер тренировки")
 async def timer_menu(message: types.Message):
     async for session in db_session.create_async_session():
@@ -773,10 +726,11 @@ async def timer_set_type(message: types.Message, state: FSMContext):
         activity = act_type_res.scalars().first()
 
         if not activity:
-            await message.answer("❌ Такой тип активности не найден. Попробуйте другое название.")
+            await message.answer("❌ Такой тип активности не найден. Попробуйте другое название.",
+                                 reply_markup=cancel_bio_kb())
             return
 
-        start_time = datetime.now()
+        start_time = datetime.now(MSK)
 
         try:
             if timer:
@@ -796,7 +750,6 @@ async def timer_set_type(message: types.Message, state: FSMContext):
 
         except Exception as e:
             await session.rollback()
-            print(f"Ошибка при сохранении таймера: {e}")
             await message.answer("❌ Ошибка базы данных при запуске.")
             await state.clear()
             return
@@ -824,15 +777,70 @@ async def timer_set_type(message: types.Message, state: FSMContext):
         await state.clear()
 
 
+# переставил чтобы легче ориентироваться в коде
+async def update_timer_message(user_id: int, chat_id: int, message_id: int, activity_type: str, start_time: datetime):
+    try:
+        if start_time.tzinfo is None:
+            start_time = start_time.replace(tzinfo=MSK)
+
+        while True:
+            if user_id not in active_timer_tasks:
+                break
+
+            now = datetime.now(MSK)
+            elapsed = now - start_time
+            total_seconds = int(elapsed.total_seconds())
+
+            if total_seconds < 0:
+                total_seconds = 0
+
+            minutes, seconds = divmod(total_seconds, 60)
+            hours, minutes = divmod(minutes, 3600)
+
+            bar_filled = int((seconds / 60) * 10)
+            bar = "█" * bar_filled + "░" * (10 - bar_filled)
+
+            timer_text = (
+                f"⏱ <b>ТАЙМЕР АКТИВЕН</b>\n\n"
+                f"🏃 Активность: <b>{activity_type}</b>\n"
+                f"⏱ Время: <b>{hours:02d}:{minutes:02d}:{seconds:02d}</b>\n"
+                f"[{bar}] {seconds}с\n\n"
+                f"📅 Начало: {start_time.strftime('%H:%M:%S')}\n"
+                f"🔄 Обновление раз в {freetime} секунды."
+            )
+
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=timer_text,
+                    reply_markup=timer_kb(is_active=True)
+                )
+            except TelegramBadRequest as e:
+                if "message is not modified" not in str(e):
+                    print(f"Ошибка обновления таймера: {e}")
+                    break
+            except Exception as e:
+                print(f"Ошибка таймера: {e}")
+                break
+
+            await asyncio.sleep(freetime)
+
+    except asyncio.CancelledError:
+        pass
+    finally:
+        active_timer_tasks.pop(user_id, None)
+
+
 @dp.callback_query(F.data == "timer_stop")
 async def timer_stop(callback: types.CallbackQuery):
     weather_text = ""
     user_id = callback.from_user.id
 
     if user_id in active_timer_tasks:
-        task = active_timer_tasks[user_id]
-        task.cancel()
-        del active_timer_tasks[user_id]
+        task = active_timer_tasks.get(user_id)
+        if task:
+            task.cancel()
 
     async for session in db_session.create_async_session():
         result = await session.execute(
@@ -847,11 +855,16 @@ async def timer_stop(callback: types.CallbackQuery):
             await callback.answer("❌ Нет активного таймера!", show_alert=True)
             return
 
-        elapsed = datetime.now() - timer.start_time
+        start_time = timer.start_time
+        if start_time.tzinfo is None:
+            start_time = start_time.replace(tzinfo=MSK)
+
+        elapsed = datetime.now(MSK) - start_time
         total_seconds = int(elapsed.total_seconds())
-        minutes = max(1, total_seconds // 60)
-        hours = total_seconds // 3600
-        remaining_seconds = total_seconds % 60
+
+        minutes, seconds = divmod(total_seconds, 60)
+        hours, minutes = divmod(total_seconds, 3600)
+        db_minutes = max(1, total_seconds // 60)
 
         act_result = await session.execute(
             select(ActivityType).where(ActivityType.name == timer.activity_type)
@@ -862,10 +875,9 @@ async def timer_stop(callback: types.CallbackQuery):
             new_activity = Activity(
                 user_id=user_id,
                 activity_type_id=activity_type.id,
-                duration=minutes
+                duration=db_minutes
             )
             session.add(new_activity)
-
             timer.is_active = False
 
             bio_result = await session.execute(
@@ -883,16 +895,15 @@ async def timer_stop(callback: types.CallbackQuery):
 
             await session.commit()
 
-            leveled_up, new_level = await update_user_experience(user_id, minutes)
-
-            time_str = f"{hours:02d}:{minutes % 60:02d}:{remaining_seconds:02d}"
+            leveled_up, new_level = await update_user_experience(user_id, db_minutes)
+            time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
             response = (
                 f"⏹ <b>ТАЙМЕР ОСТАНОВЛЕН</b>\n\n"
                 f"🏃 Активность: <b>{timer.activity_type}</b>\n"
                 f"⏱ Длительность: <b>{time_str}</b>\n"
-                f"📊 Зачтено минут: <b>{minutes} мин.</b>\n"
-                f"📅 {timer.start_time.strftime('%H:%M:%S')} - {datetime.now().strftime('%H:%M:%S')}"
+                f"📊 Зачтено минут: <b>{db_minutes} мин.</b>\n"
+                f"📅 {start_time.strftime('%H:%M:%S')} - {datetime.now(MSK).strftime('%H:%M:%S')}"
                 f"{weather_text}"
             )
 
@@ -900,17 +911,13 @@ async def timer_stop(callback: types.CallbackQuery):
                 level_title = LEVEL_TITLES.get(new_level, "")
                 response += f'\n\n🎉 Поздравляем! Вы достигли {new_level} уровня - {level_title}!'
 
-            await callback.message.edit_text(
-                response,
-                reply_markup=timer_kb(is_active=False)
-            )
+            await callback.message.edit_text(response,
+                                             reply_markup=timer_kb(is_active=False))
         else:
             timer.is_active = False
             await session.commit()
-            await callback.message.edit_text(
-                "⏹ Таймер остановлен (тип активности не найден)",
-                reply_markup=timer_kb(is_active=False)
-            )
+            await callback.message.edit_text("⏹ Таймер остановлен (тип активности не найден)",
+                                             reply_markup=timer_kb(is_active=False))
 
         await callback.answer("✅ Таймер остановлен!")
 
@@ -1034,7 +1041,7 @@ async def get_activities_summary(user_id: int, days: int = None, start_date: dat
 async def get_total_stats(user_id: int, days: int = None, start_date: date = None):
     async for session in db_session.create_async_session():
         query = select(
-            func.sum(Activity.duration).label('total_minutes'),
+            func.coalesce(func.sum(Activity.duration), 0).label('total_minutes'),
             func.count(Activity.id).label('total_activities')
         ).where(
             Activity.user_id == user_id
@@ -1051,7 +1058,7 @@ async def get_total_stats(user_id: int, days: int = None, start_date: date = Non
 
 
 def format_stats_message(period_name: str, activities, total_stats):
-    if not total_stats or total_stats.total_minutes == 0:
+    if not total_stats or total_stats.total_minutes is None or total_stats.total_minutes == 0:
         return f"📊 <b>Статистика за {period_name}</b>\n\n📭 Пока нет данных об активностях."
 
     hours = total_stats.total_minutes // 60
@@ -1310,11 +1317,6 @@ async def main():
 
     db_path = os.path.join(db_dir, "tracker.db")
     print(f"📁 База данных: {db_path}")
-    #
-    # if os.path.exists(db_path):
-    #     print("🗑 Удаляю старую базу данных...")
-    #     os.remove(db_path)
-    #
     db_session.global_init(db_path)
     print("✅ База данных инициализирована")
 
